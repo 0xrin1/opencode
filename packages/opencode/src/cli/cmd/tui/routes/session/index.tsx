@@ -5,6 +5,7 @@ import {
   createSignal,
   For,
   Match,
+  on,
   Show,
   Switch,
   useContext,
@@ -16,16 +17,9 @@ import { useRoute, useRouteData } from "@tui/context/route"
 import { useSync } from "@tui/context/sync"
 import { SplitBorder } from "@tui/component/border"
 import { useTheme } from "@tui/context/theme"
-import { BoxRenderable, ScrollBoxRenderable, addDefaultParsers } from "@opentui/core"
+import { BoxRenderable, ScrollBoxRenderable, TextAttributes, addDefaultParsers } from "@opentui/core"
 import { Prompt, type PromptRef } from "@tui/component/prompt"
-import type {
-  AssistantMessage,
-  Part,
-  ToolPart,
-  UserMessage,
-  TextPart,
-  ReasoningPart,
-} from "@opencode-ai/sdk"
+import type { AssistantMessage, Part, ToolPart, UserMessage, TextPart, ReasoningPart } from "@opencode-ai/sdk"
 import { useLocal } from "@tui/context/local"
 import { Locale } from "@/util/locale"
 import type { Tool } from "@/tool/tool"
@@ -40,13 +34,7 @@ import type { EditTool } from "@/tool/edit"
 import type { PatchTool } from "@/tool/patch"
 import type { WebFetchTool } from "@/tool/webfetch"
 import type { TaskTool } from "@/tool/task"
-import {
-  useKeyboard,
-  useRenderer,
-  useTerminalDimensions,
-  type BoxProps,
-  type JSX,
-} from "@opentui/solid"
+import { useKeyboard, useRenderer, useTerminalDimensions, type BoxProps, type JSX } from "@opentui/solid"
 import { useSDK } from "@tui/context/sdk"
 import { useCommandDialog } from "@tui/component/dialog-command"
 import { Shimmer } from "@tui/ui/shimmer"
@@ -59,12 +47,18 @@ import type { PromptInfo } from "../../component/prompt/history"
 import { iife } from "@/util/iife"
 import { DialogConfirm } from "@tui/ui/dialog-confirm"
 import { DialogTimeline } from "./dialog-timeline"
+import { DialogSessionRename } from "../../component/dialog-session-rename"
 import { Sidebar } from "./sidebar"
 import { LANGUAGE_EXTENSIONS } from "@/lsp/language"
 import parsers from "../../../../../../parsers-config.ts"
 import { Clipboard } from "../../util/clipboard"
 import { Toast, useToast } from "../../ui/toast"
 import { useKV } from "../../context/kv.tsx"
+import { Editor } from "../../util/editor"
+import { Global } from "@/global"
+import fs from "fs/promises"
+import stripAnsi from "strip-ansi"
+import { LSP } from "@/lsp/index.ts"
 
 addDefaultParsers(parsers.parsers)
 
@@ -101,7 +95,20 @@ export function Session() {
   const sidebarVisible = createMemo(() => sidebar() === "show" || (sidebar() === "auto" && wide()))
   const contentWidth = createMemo(() => dimensions().width - (sidebarVisible() ? 42 : 0) - 4)
 
-  createEffect(() => sync.session.sync(route.sessionID))
+  createEffect(async () => {
+    await sync.session
+      .sync(route.sessionID)
+      .then(() => {
+        if (scroll) scroll.scrollBy(100_000)
+      })
+      .catch(() => {
+        toast.show({
+          message: `Session not found: ${route.sessionID}`,
+          variant: "error",
+        })
+        return navigate({ type: "home" })
+      })
+  })
 
   const toast = useToast()
 
@@ -120,6 +127,7 @@ export function Session() {
         if (evt.name === "return") return "once"
         if (evt.name === "a") return "always"
         if (evt.name === "d") return "reject"
+        if (evt.name === "escape") return "reject"
         return
       })
       if (response) {
@@ -138,15 +146,9 @@ export function Session() {
 
   function toBottom() {
     setTimeout(() => {
-      scroll.scrollTo(scroll.scrollHeight)
+      if (scroll) scroll.scrollTo(scroll.scrollHeight)
     }, 50)
   }
-
-  // snap to bottom when revert position changes
-  createEffect((old) => {
-    if (old !== session()?.revert?.messageID) toBottom()
-    return session()?.revert?.messageID
-  })
 
   const local = useLocal()
 
@@ -169,6 +171,15 @@ export function Session() {
 
   const command = useCommandDialog()
   command.register(() => [
+    {
+      title: "Rename session",
+      value: "session.rename",
+      keybind: "session_rename",
+      category: "Session",
+      onSelect: (dialog) => {
+        dialog.replace(() => <DialogSessionRename session={route.sessionID} />)
+      },
+    },
     {
       title: "Jump to message",
       value: "session.timeline",
@@ -206,29 +217,33 @@ export function Session() {
         dialog.clear()
       },
     },
-    {
-      title: "Share session",
-      value: "session.share",
-      keybind: "session_share",
-      disabled: !!session()?.share?.url,
-      category: "Session",
-      onSelect: async (dialog) => {
-        await sdk.client.session
-          .share({
-            path: {
-              id: route.sessionID,
+    ...(sync.data.config.share !== "disabled"
+      ? [
+          {
+            title: "Share session",
+            value: "session.share",
+            keybind: "session_share" as const,
+            disabled: !!session()?.share?.url,
+            category: "Session",
+            onSelect: async (dialog: any) => {
+              await sdk.client.session
+                .share({
+                  path: {
+                    id: route.sessionID,
+                  },
+                })
+                .then((res) =>
+                  Clipboard.copy(res.data!.share!.url).catch(() =>
+                    toast.show({ message: "Failed to copy URL to clipboard", variant: "error" }),
+                  ),
+                )
+                .then(() => toast.show({ message: "Share URL copied to clipboard!", variant: "success" }))
+                .catch(() => toast.show({ message: "Failed to share session", variant: "error" }))
+              dialog.clear()
             },
-          })
-          .then((res) =>
-            Clipboard.copy(res.data!.share!.url).catch(() =>
-              toast.show({ message: "Failed to copy URL to clipboard", variant: "error" }),
-            ),
-          )
-          .then(() => toast.show({ message: "Share URL copied to clipboard!", variant: "success" }))
-          .catch(() => toast.show({ message: "Failed to share session", variant: "error" }))
-        dialog.clear()
-      },
-    },
+          },
+        ]
+      : []),
     {
       title: "Unshare session",
       value: "session.unshare",
@@ -253,14 +268,18 @@ export function Session() {
         const revert = session().revert?.messageID
         const message = messages().findLast((x) => (!revert || x.id < revert) && x.role === "user")
         if (!message) return
-        sdk.client.session.revert({
-          path: {
-            id: route.sessionID,
-          },
-          body: {
-            messageID: message.id,
-          },
-        })
+        sdk.client.session
+          .revert({
+            path: {
+              id: route.sessionID,
+            },
+            body: {
+              messageID: message.id,
+            },
+          })
+          .then(() => {
+            toBottom()
+          })
         const parts = sync.data.part[message.id]
         prompt.set(
           parts.reduce(
@@ -308,7 +327,7 @@ export function Session() {
       },
     },
     {
-      title: "Toggle sidebar",
+      title: sidebarVisible() ? "Hide sidebar" : "Show sidebar",
       value: "session.sidebar.toggle",
       keybind: "sidebar_toggle",
       category: "Session",
@@ -446,6 +465,105 @@ export function Session() {
       },
     },
     {
+      title: "Copy session transcript",
+      value: "session.copy",
+      keybind: "session_copy",
+      category: "Session",
+      onSelect: async (dialog) => {
+        try {
+          // Format session transcript as markdown
+          const sessionData = session()
+          const sessionMessages = messages()
+
+          let transcript = `# ${sessionData.title}\n\n`
+          transcript += `**Session ID:** ${sessionData.id}\n`
+          transcript += `**Created:** ${new Date(sessionData.time.created).toLocaleString()}\n`
+          transcript += `**Updated:** ${new Date(sessionData.time.updated).toLocaleString()}\n\n`
+          transcript += `---\n\n`
+
+          for (const msg of sessionMessages) {
+            const parts = sync.data.part[msg.id] ?? []
+            const role = msg.role === "user" ? "User" : "Assistant"
+            transcript += `## ${role}\n\n`
+
+            for (const part of parts) {
+              if (part.type === "text" && !part.synthetic) {
+                transcript += `${part.text}\n\n`
+              } else if (part.type === "tool") {
+                transcript += `\`\`\`\nTool: ${part.tool}\n\`\`\`\n\n`
+              }
+            }
+
+            transcript += `---\n\n`
+          }
+
+          // Copy to clipboard
+          await Clipboard.copy(transcript)
+          toast.show({ message: "Session transcript copied to clipboard!", variant: "success" })
+        } catch (error) {
+          toast.show({ message: "Failed to copy session transcript", variant: "error" })
+        }
+        dialog.clear()
+      },
+    },
+    {
+      title: "Export session transcript to file",
+      value: "session.export",
+      keybind: "session_export",
+      category: "Session",
+      onSelect: async (dialog) => {
+        try {
+          // Format session transcript as markdown
+          const sessionData = session()
+          const sessionMessages = messages()
+
+          let transcript = `# ${sessionData.title}\n\n`
+          transcript += `**Session ID:** ${sessionData.id}\n`
+          transcript += `**Created:** ${new Date(sessionData.time.created).toLocaleString()}\n`
+          transcript += `**Updated:** ${new Date(sessionData.time.updated).toLocaleString()}\n\n`
+          transcript += `---\n\n`
+
+          for (const msg of sessionMessages) {
+            const parts = sync.data.part[msg.id] ?? []
+            const role = msg.role === "user" ? "User" : "Assistant"
+            transcript += `## ${role}\n\n`
+
+            for (const part of parts) {
+              if (part.type === "text" && !part.synthetic) {
+                transcript += `${part.text}\n\n`
+              } else if (part.type === "tool") {
+                transcript += `\`\`\`\nTool: ${part.tool}\n\`\`\`\n\n`
+              }
+            }
+
+            transcript += `---\n\n`
+          }
+
+          // Save to file in data directory
+          const exportDir = path.join(Global.Path.data, "exports")
+          await fs.mkdir(exportDir, { recursive: true })
+
+          const timestamp = new Date().toISOString().replace(/[:.]/g, "-")
+          const filename = `session-${sessionData.id.slice(0, 8)}-${timestamp}.md`
+          const filepath = path.join(exportDir, filename)
+
+          await Bun.write(filepath, transcript)
+
+          // Open with EDITOR if available
+          const result = await Editor.open({ value: transcript, renderer })
+          if (result !== undefined) {
+            // User edited the file, save the changes
+            await Bun.write(filepath, result)
+          }
+
+          toast.show({ message: `Session exported to ${filename}`, variant: "success" })
+        } catch (error) {
+          toast.show({ message: "Failed to export session", variant: "error" })
+        }
+        dialog.clear()
+      },
+    },
+    {
       title: "Next child session",
       value: "session.child.next",
       keybind: "session_child_cycle",
@@ -513,6 +631,9 @@ export function Session() {
   const dialog = useDialog()
   const renderer = useRenderer()
 
+  // snap to bottom when session changes
+  createEffect(on(() => route.sessionID, toBottom))
+
   return (
     <context.Provider
       value={{
@@ -522,14 +643,7 @@ export function Session() {
         conceal,
       }}
     >
-      <box
-        flexDirection="row"
-        paddingBottom={1}
-        paddingTop={1}
-        paddingLeft={2}
-        paddingRight={2}
-        gap={2}
-      >
+      <box flexDirection="row" paddingBottom={1} paddingTop={1} paddingLeft={2} paddingRight={2} gap={2}>
         <box flexGrow={1} gap={1}>
           <Show when={session()}>
             <Show when={session().parentID}>
@@ -544,19 +658,13 @@ export function Session() {
                 paddingRight={2}
               >
                 <text fg={theme.text}>
-                  Previous{" "}
-                  <span style={{ fg: theme.textMuted }}>
-                    {keybind.print("session_child_cycle_reverse")}
-                  </span>
+                  Previous <span style={{ fg: theme.textMuted }}>{keybind.print("session_child_cycle_reverse")}</span>
                 </text>
                 <text fg={theme.text}>
                   <b>Viewing subagent session</b>
                 </text>
                 <text fg={theme.text}>
-                  <span style={{ fg: theme.textMuted }}>
-                    {keybind.print("session_child_cycle")}
-                  </span>{" "}
-                  Next
+                  <span style={{ fg: theme.textMuted }}>{keybind.print("session_child_cycle")}</span> Next
                 </text>
               </box>
             </Show>
@@ -565,7 +673,14 @@ export function Session() {
             </Show>
             <scrollbox
               ref={(r) => (scroll = r)}
-              scrollbarOptions={{ visible: false }}
+              scrollbarOptions={{
+                paddingLeft: 2,
+                visible: false,
+                trackOptions: {
+                  backgroundColor: theme.backgroundElement,
+                  foregroundColor: theme.border,
+                },
+              }}
               stickyScroll={true}
               stickyStart="bottom"
               flexGrow={1}
@@ -605,18 +720,12 @@ export function Session() {
                               paddingTop={1}
                               paddingBottom={1}
                               paddingLeft={2}
-                              backgroundColor={
-                                hover() ? theme.backgroundElement : theme.backgroundPanel
-                              }
+                              backgroundColor={hover() ? theme.backgroundElement : theme.backgroundPanel}
                             >
+                              <text fg={theme.textMuted}>{revert()!.reverted.length} message reverted</text>
                               <text fg={theme.textMuted}>
-                                {revert()!.reverted.length} message reverted
-                              </text>
-                              <text fg={theme.textMuted}>
-                                <span style={{ fg: theme.text }}>
-                                  {keybind.print("messages_redo")}
-                                </span>{" "}
-                                or /redo to restore
+                                <span style={{ fg: theme.text }}>{keybind.print("messages_redo")}</span> or /redo to
+                                restore
                               </text>
                               <Show when={revert()!.diffFiles?.length}>
                                 <box marginTop={1}>
@@ -625,16 +734,10 @@ export function Session() {
                                       <text>
                                         {file.filename}
                                         <Show when={file.additions > 0}>
-                                          <span style={{ fg: theme.diffAdded }}>
-                                            {" "}
-                                            +{file.additions}
-                                          </span>
+                                          <span style={{ fg: theme.diffAdded }}> +{file.additions}</span>
                                         </Show>
                                         <Show when={file.deletions > 0}>
-                                          <span style={{ fg: theme.diffRemoved }}>
-                                            {" "}
-                                            -{file.deletions}
-                                          </span>
+                                          <span style={{ fg: theme.diffRemoved }}> -{file.deletions}</span>
                                         </Show>
                                       </text>
                                     )}
@@ -654,9 +757,7 @@ export function Session() {
                         index={index()}
                         onMouseUp={() => {
                           if (renderer.getSelection()?.getSelectedText()) return
-                          dialog.replace(() => (
-                            <DialogMessage messageID={message.id} sessionID={route.sessionID} />
-                          ))
+                          dialog.replace(() => <DialogMessage messageID={message.id} sessionID={route.sessionID} />)
                         }}
                         message={message as UserMessage}
                         parts={sync.data.part[message.id] ?? []}
@@ -712,9 +813,7 @@ function UserMessage(props: {
   index: number
   pending?: string
 }) {
-  const text = createMemo(
-    () => props.parts.flatMap((x) => (x.type === "text" && !x.synthetic ? [x] : []))[0],
-  )
+  const text = createMemo(() => props.parts.flatMap((x) => (x.type === "text" && !x.synthetic ? [x] : []))[0])
   const files = createMemo(() => props.parts.flatMap((x) => (x.type === "file" ? [x] : [])))
   const sync = useSync()
   const { theme } = useTheme()
@@ -755,14 +854,8 @@ function UserMessage(props: {
                 })
                 return (
                   <text fg={theme.text}>
-                    <span style={{ bg: bg(), fg: theme.background }}>
-                      {" "}
-                      {MIME_BADGE[file.mime] ?? file.mime}{" "}
-                    </span>
-                    <span style={{ bg: theme.backgroundElement, fg: theme.textMuted }}>
-                      {" "}
-                      {file.filename}{" "}
-                    </span>
+                    <span style={{ bg: bg(), fg: theme.background }}> {MIME_BADGE[file.mime] ?? file.mime} </span>
+                    <span style={{ bg: theme.backgroundElement, fg: theme.textMuted }}> {file.filename} </span>
                   </text>
                 )
               }}
@@ -773,16 +866,9 @@ function UserMessage(props: {
           {sync.data.config.username ?? "You"}{" "}
           <Show
             when={queued()}
-            fallback={
-              <span style={{ fg: theme.textMuted }}>
-                ({Locale.time(props.message.time.created)})
-              </span>
-            }
+            fallback={<span style={{ fg: theme.textMuted }}>({Locale.time(props.message.time.created)})</span>}
           >
-            <span style={{ bg: theme.accent, fg: theme.backgroundPanel, bold: true }}>
-              {" "}
-              QUEUED{" "}
-            </span>
+            <span style={{ bg: theme.accent, fg: theme.backgroundPanel, bold: true }}> QUEUED </span>
           </Show>
         </text>
       </box>
@@ -796,11 +882,16 @@ function AssistantMessage(props: { message: AssistantMessage; parts: Part[]; las
   return (
     <>
       <For each={props.parts}>
-        {(part) => {
+        {(part, index) => {
           const component = createMemo(() => PART_MAPPING[part.type as keyof typeof PART_MAPPING])
           return (
             <Show when={component()}>
-              <Dynamic component={component()} part={part as any} message={props.message} />
+              <Dynamic
+                last={index() === props.parts.length - 1}
+                component={component()}
+                part={part as any}
+                message={props.message}
+              />
             </Show>
           )
         }}
@@ -822,8 +913,7 @@ function AssistantMessage(props: { message: AssistantMessage; parts: Part[]; las
       <Show
         when={
           !props.message.time.completed ||
-          (props.last &&
-            props.parts.some((item) => item.type === "step-finish" && item.reason === "tool-calls"))
+          (props.last && props.parts.some((item) => item.type === "step-finish" && item.reason === "tool-calls"))
         }
       >
         <box
@@ -835,9 +925,7 @@ function AssistantMessage(props: { message: AssistantMessage; parts: Part[]; las
           customBorderChars={SplitBorder.customBorderChars}
           borderColor={theme.backgroundElement}
         >
-          <text fg={local.agent.color(props.message.mode)}>
-            {Locale.titlecase(props.message.mode)}
-          </text>
+          <text fg={local.agent.color(props.message.mode)}>{Locale.titlecase(props.message.mode)}</text>
           <Shimmer text={`${props.message.modelID}`} color={theme.text} />
         </box>
       </Show>
@@ -849,9 +937,7 @@ function AssistantMessage(props: { message: AssistantMessage; parts: Part[]; las
       >
         <box paddingLeft={3}>
           <text marginTop={1}>
-            <span style={{ fg: local.agent.color(props.message.mode) }}>
-              {Locale.titlecase(props.message.mode)}
-            </span>{" "}
+            <span style={{ fg: local.agent.color(props.message.mode) }}>{Locale.titlecase(props.message.mode)}</span>{" "}
             <span style={{ fg: theme.textMuted }}>{props.message.modelID}</span>
           </text>
         </box>
@@ -866,32 +952,36 @@ const PART_MAPPING = {
   reasoning: ReasoningPart,
 }
 
-function ReasoningPart(props: { part: ReasoningPart; message: AssistantMessage }) {
-  const { theme } = useTheme()
+function ReasoningPart(props: { last: boolean; part: ReasoningPart; message: AssistantMessage }) {
+  const { theme, syntax } = useTheme()
+  const ctx = use()
+  const content = createMemo(() => props.part.text.trim())
   return (
-    <Show when={props.part.text.trim()}>
+    <Show when={content()}>
       <box
         id={"text-" + props.part.id}
+        paddingLeft={2}
         marginTop={1}
-        flexShrink={0}
+        flexDirection="column"
         border={["left"]}
         customBorderChars={SplitBorder.customBorderChars}
-        borderColor={theme.backgroundPanel}
+        borderColor={theme.backgroundElement}
       >
-        <box
-          paddingTop={1}
-          paddingBottom={1}
-          paddingLeft={2}
-          backgroundColor={theme.backgroundPanel}
-        >
-          <text fg={theme.text}>{props.part.text.trim()}</text>
-        </box>
+        <code
+          filetype="markdown"
+          drawUnstyledText={false}
+          streaming={true}
+          syntaxStyle={syntax()}
+          content={"_Thinking:_ " + content()}
+          conceal={ctx.conceal()}
+          fg={theme.text}
+        />
       </box>
     </Show>
   )
 }
 
-function TextPart(props: { part: TextPart; message: AssistantMessage }) {
+function TextPart(props: { last: boolean; part: TextPart; message: AssistantMessage }) {
   const ctx = use()
   const { syntax } = useTheme()
   return (
@@ -900,6 +990,7 @@ function TextPart(props: { part: TextPart; message: AssistantMessage }) {
         <code
           filetype="markdown"
           drawUnstyledText={false}
+          streaming={true}
           syntaxStyle={syntax()}
           content={props.part.text.trim()}
           conceal={ctx.conceal()}
@@ -911,7 +1002,7 @@ function TextPart(props: { part: TextPart; message: AssistantMessage }) {
 
 // Pending messages moved to individual tool pending functions
 
-function ToolPart(props: { part: ToolPart; message: AssistantMessage }) {
+function ToolPart(props: { last: boolean; part: ToolPart; message: AssistantMessage }) {
   const { theme } = useTheme()
   const sync = useSync()
   const [margin, setMargin] = createSignal(0)
@@ -1060,7 +1151,7 @@ ToolRegistry.register<typeof BashTool>({
   name: "bash",
   container: "block",
   render(props) {
-    const output = createMemo(() => Bun.stripANSI(props.metadata.output?.trim() ?? ""))
+    const output = createMemo(() => stripAnsi(props.metadata.output?.trim() ?? ""))
     const { theme } = useTheme()
     return (
       <>
@@ -1115,6 +1206,8 @@ ToolRegistry.register<typeof WriteTool>({
         .map((x) => x.toString().padStart(pad, " "))
     })
 
+    const diagnostics = createMemo(() => props.metadata.diagnostics?.[props.input.filePath ?? ""] ?? [])
+
     return (
       <>
         <ToolTitle icon="←" fallback="Preparing write..." when={props.input.filePath}>
@@ -1122,18 +1215,21 @@ ToolRegistry.register<typeof WriteTool>({
         </ToolTitle>
         <box flexDirection="row">
           <box flexShrink={0}>
-            <For each={numbers()}>
-              {(value) => <text style={{ fg: theme.textMuted }}>{value}</text>}
-            </For>
+            <For each={numbers()}>{(value) => <text style={{ fg: theme.textMuted }}>{value}</text>}</For>
           </box>
           <box paddingLeft={1} flexGrow={1}>
-            <code
-              filetype={filetype(props.input.filePath!)}
-              syntaxStyle={syntax()}
-              content={code()}
-            />
+            <code filetype={filetype(props.input.filePath!)} syntaxStyle={syntax()} content={code()} />
           </box>
         </box>
+        <Show when={diagnostics().length}>
+          <For each={diagnostics()}>
+            {(diagnostic) => (
+              <text fg={theme.error}>
+                Error [{diagnostic.range.start.line}:{diagnostic.range.start.character}]: {diagnostic.message}
+              </text>
+            )}
+          </For>
+        </Show>
       </>
     )
   },
@@ -1146,8 +1242,7 @@ ToolRegistry.register<typeof GlobTool>({
     return (
       <>
         <ToolTitle icon="✱" fallback="Finding files..." when={props.input.pattern}>
-          Glob "{props.input.pattern}"{" "}
-          <Show when={props.input.path}>in {normalizePath(props.input.path)} </Show>
+          Glob "{props.input.pattern}" <Show when={props.input.path}>in {normalizePath(props.input.path)} </Show>
           <Show when={props.metadata.count}>({props.metadata.count} matches)</Show>
         </ToolTitle>
       </>
@@ -1161,8 +1256,7 @@ ToolRegistry.register<typeof GrepTool>({
   render(props) {
     return (
       <ToolTitle icon="✱" fallback="Searching content..." when={props.input.pattern}>
-        Grep "{props.input.pattern}"{" "}
-        <Show when={props.input.path}>in {normalizePath(props.input.path)} </Show>
+        Grep "{props.input.pattern}" <Show when={props.input.path}>in {normalizePath(props.input.path)} </Show>
         <Show when={props.metadata.matches}>({props.metadata.matches} matches)</Show>
       </ToolTitle>
     )
@@ -1198,11 +1292,7 @@ ToolRegistry.register<typeof TaskTool>({
 
     return (
       <>
-        <ToolTitle
-          icon="%"
-          fallback="Delegating..."
-          when={props.input.subagent_type ?? props.input.description}
-        >
+        <ToolTitle icon="%" fallback="Delegating..." when={props.input.subagent_type ?? props.input.description}>
           Task [{props.input.subagent_type ?? "unknown"}] {props.input.description}
         </ToolTitle>
         <Show when={props.metadata.summary?.length}>
@@ -1317,6 +1407,12 @@ ToolRegistry.register<typeof EditTool>({
 
     const ft = createMemo(() => filetype(props.input.filePath))
 
+    createEffect(() => console.log(props.metadata.diagnostics))
+    const diagnostics = createMemo(() => {
+      const arr = props.metadata.diagnostics?.[props.input.filePath ?? ""] ?? []
+      return arr.filter((x) => x.severity === 1).slice(0, 3)
+    })
+
     return (
       <>
         <ToolTitle icon="←" fallback="Preparing edit..." when={props.input.filePath}>
@@ -1345,6 +1441,17 @@ ToolRegistry.register<typeof EditTool>({
             </box>
           </Match>
         </Switch>
+        <Show when={diagnostics().length}>
+          <box>
+            <For each={diagnostics()}>
+              {(diagnostic) => (
+                <text fg={theme.error}>
+                  Error [{diagnostic.range.start.line + 1}:{diagnostic.range.start.character + 1}] {diagnostic.message}
+                </text>
+              )}
+            </For>
+          </box>
+        </Show>
       </>
     )
   },
@@ -1376,15 +1483,24 @@ ToolRegistry.register<typeof TodoWriteTool>({
   render(props) {
     const { theme } = useTheme()
     return (
-      <box>
-        <For each={props.input.todos ?? []}>
-          {(todo) => (
-            <text style={{ fg: todo.status === "in_progress" ? theme.success : theme.textMuted }}>
-              [{todo.status === "completed" ? "✓" : " "}] {todo.content}
-            </text>
-          )}
-        </For>
-      </box>
+      <>
+        <Show when={!props.input.todos?.length}>
+          <ToolTitle icon="⚙" fallback="Updating todos..." when={true}>
+            Updating todos...
+          </ToolTitle>
+        </Show>
+        <Show when={props.metadata.todos?.length}>
+          <box>
+            <For each={props.input.todos ?? []}>
+              {(todo) => (
+                <text style={{ fg: todo.status === "in_progress" ? theme.success : theme.textMuted }}>
+                  [{todo.status === "completed" ? "✓" : " "}] {todo.content}
+                </text>
+              )}
+            </For>
+          </box>
+        </Show>
+      </>
     )
   },
 })
